@@ -373,7 +373,13 @@ namespace Moraecat.ResourceListCache
             _original = original;
             _workshopGetter = workshopGetter;
             string folderComponent = "/" + folder.ToLower() + "/";
-            _scopePredicate = key => key.Contains(folderComponent, StringComparison.Ordinal);
+            // StreamingAssets 루트(소문자 슬래시 정규화)를 미리 계산해 둔다.
+            // 로컬 엔트리의 키는 이 prefix 로 시작하므로, 워크숍 predicate 에서 반드시 제외해야 한다.
+            // 워크숍 설치 경로는 steamapps/workshop/content/... 이므로 이 prefix 와 겹치지 않는다.
+            string streamingAssetsPrefix = Application.streamingAssetsPath.ToLower().Replace('\\', '/');
+            _scopePredicate = key =>
+                key.Contains(folderComponent, StringComparison.Ordinal) &&
+                !key.StartsWith(streamingAssetsPrefix, StringComparison.Ordinal);
         }
 
         public List<Resource> ProvideResources(string query)
