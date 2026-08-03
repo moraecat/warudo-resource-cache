@@ -46,7 +46,8 @@ namespace Moraecat.ResourceListCache
     /// <summary>두 캐싱 프로바이더가 공유하는 설정 상수.</summary>
     internal static class CacheSettings
     {
-        /// <summary>true 이면 쿼리별 최초 1회 원본과 결과를 비교해 불일치를 Warning 로 출력한다.</summary>
+        /// <summary>true 이면 쿼리별 최초 1회 원본과 결과를 비교해 불일치를 Warning 로 출력한다.
+        /// NOTE: Playground 검증 단계에서는 true. 배포용 .warudo 패키징 전에 false 로 변경할 것.</summary>
         public const bool VerifyAgainstOriginal = true;
     }
 
@@ -413,13 +414,23 @@ namespace Moraecat.ResourceListCache
                 foreach (WorkshopFileEntry it in entries)
                 {
                     string fullPath = workshop.GetFullPath(it.itemId, it.relativePath);
-                    string label = _cache.GetOrResolve(fullPath, it.lastModifiedTime);
+                    // GetFullPath returns null when GetItemInstallInfo fails (Steam offline / incomplete install).
+                    // Guard: skip expensive name resolution and fall back to filename as label (convention).
+                    string label;
+                    if (fullPath != null)
+                    {
+                        label = _cache.GetOrResolve(fullPath, it.lastModifiedTime);
+                        activePaths.Add(fullPath);
+                    }
+                    else
+                    {
+                        label = Path.GetFileName(it.relativePath);
+                    }
                     result.Add(new Resource
                     {
                         label = label,
                         uri = new Uri(_scheme + "://workshop/" + it.itemId + "/" + it.relativePath)
                     });
-                    if (fullPath != null) activePaths.Add(fullPath);
                 }
 
                 // 워크숍은 UseFilenameForDuplicates 적용 안 함 (원본과 동일)
