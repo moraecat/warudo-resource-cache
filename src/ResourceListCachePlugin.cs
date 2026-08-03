@@ -47,8 +47,8 @@ namespace Moraecat.ResourceListCache
     internal static class CacheSettings
     {
         /// <summary>true 이면 쿼리별 최초 1회 원본과 결과를 비교해 불일치를 Warning 로 출력한다.
-        /// NOTE: Playground 검증 단계에서는 true. 배포용 .warudo 패키징 전에 false 로 변경할 것.</summary>
-        public const bool VerifyAgainstOriginal = true;
+        /// 2026-08-04 실기 검증 완료 (4개 쿼리 전부 VERIFY OK) — 이후 false 유지.</summary>
+        public const bool VerifyAgainstOriginal = false;
     }
 
     // ─── NameCache ──────────────────────────────────────────────────────────────
