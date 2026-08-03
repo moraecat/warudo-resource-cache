@@ -41,6 +41,15 @@ namespace Moraecat.ResourceListCache
         public string Label { get; set; }
     }
 
+    // ─── 공유 상수 ────────────────────────────────────────────────────────────────
+
+    /// <summary>두 캐싱 프로바이더가 공유하는 설정 상수.</summary>
+    internal static class CacheSettings
+    {
+        /// <summary>true 이면 쿼리별 최초 1회 원본과 결과를 비교해 불일치를 Warning 로 출력한다.</summary>
+        public const bool VerifyAgainstOriginal = true;
+    }
+
     // ─── NameCache ──────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -112,66 +121,38 @@ namespace Moraecat.ResourceListCache
         }
 
         /// <summary>
-        /// 이번 열거에서 사용된 키 집합만 남기고 해당 쿼리 범주의 나머지를 정리한다.
-        /// 다른 쿼리의 엔트리는 절대 제거하지 않는다.
+        /// 이번 열거에서 사용된 키 집합만 남기고 해당 쿼리 범주의 구 엔트리를 정리한다.
+        /// 범주는 <paramref name="scopePredicate"/> 로 판별하므로
+        /// 다른 쿼리(다른 폴더)의 엔트리는 절대 제거하지 않는다.
+        /// activeAbsolutePaths 가 비어있어도 (폴더가 비워진 경우) 정상 동작한다.
         /// </summary>
-        public void PruneAndSave(IEnumerable<string> activeAbsolutePaths)
+        /// <param name="activeAbsolutePaths">이번 열거에서 실제로 반환된 절대경로 목록.</param>
+        /// <param name="scopePredicate">이 쿼리 전용 범위를 판별하는 함수 (소문자 슬래시 정규화된 키를 받음).
+        /// true 를 반환하는 엔트리만 pruning 대상이 된다.</param>
+        public void PruneAndSave(IEnumerable<string> activeAbsolutePaths, Func<string, bool> scopePredicate)
         {
             // active 집합을 lower-case 화
             HashSet<string> activeKeys = new HashSet<string>(
                 activeAbsolutePaths.Select(p => p.ToLower()),
                 StringComparer.Ordinal);
 
-            // 이번 열거에서 조회된 키들만 남기되,
-            // 이번 열거에서 건드리지 않은 키는 유지 (다른 쿼리 보호)
+            // scope 에 속하면서 active 에 없는 엔트리를 제거한다.
+            // 폴더가 비어있어도 (activeKeys.Count == 0) 구 엔트리가 정리된다.
             List<string> toRemove = new List<string>();
             foreach (string key in _data.Entries.Keys)
             {
-                // activeKeys 에 속하지 않으면서 이번 열거 집합의 prefix 도 아니면 건드리지 않음
-                // => 실제로는 "이번 쿼리에서 나온 경로" 집합만 정리 기준으로 쓴다.
-                // 이 메서드는 쿼리별로 호출되므로, 이번 집합에 없는 키도 삭제하면 다른 쿼리 엔트리가 날아간다.
-                // 따라서: active 집합에 없는 것은 살려두고 active 집합 전부 확인 목적으로만 호출.
-                // => prune 은 active 집합이 비어있지 않을 때만 수행한다 (전체 실패 대비).
-                _ = toRemove; // suppress unused warning
+                if (activeKeys.Contains(key)) continue;
+                string normalizedKey = key.Replace('\\', '/');
+                if (scopePredicate(normalizedKey))
+                {
+                    toRemove.Add(key);
+                }
             }
-            // 실제 prune 전략: active 경로를 포함하는 쿼리 집합 범위만 pruning.
-            // 가장 안전한 구현: active 키들의 공통 폴더 prefix 를 찾아 그 prefix 에 속하는 엔트리 중
-            // active 에 없는 것만 제거한다.
-            if (activeKeys.Count > 0)
+
+            if (toRemove.Count > 0)
             {
-                // 이번 열거에 참여한 경로들의 prefix 집합 (폴더 구분)
-                // 단순히: active 집합에 속하지 않으면서 active 중 어느 것과 같은 "공통 경로 접두사"를 갖는 엔트리를 제거
-                // 간단한 구현: active 키 중 아무거나의 디렉토리 부분을 prefix 로 삼는다
-                HashSet<string> prefixes = new HashSet<string>(StringComparer.Ordinal);
-                foreach (string ak in activeKeys)
-                {
-                    string dir = Path.GetDirectoryName(ak);
-                    if (dir != null) prefixes.Add(dir.Replace('\\', '/'));
-                }
-
-                List<string> toRemoveActual = new List<string>();
-                foreach (string key in _data.Entries.Keys)
-                {
-                    if (activeKeys.Contains(key)) continue;
-                    string keyDir = Path.GetDirectoryName(key);
-                    if (keyDir == null) continue;
-                    keyDir = keyDir.Replace('\\', '/');
-                    // 이 key 가 이번 쿼리 범위 내의 폴더에 속하는가?
-                    foreach (string prefix in prefixes)
-                    {
-                        if (keyDir.StartsWith(prefix, StringComparison.Ordinal))
-                        {
-                            toRemoveActual.Add(key);
-                            break;
-                        }
-                    }
-                }
-
-                if (toRemoveActual.Count > 0)
-                {
-                    foreach (string k in toRemoveActual) _data.Entries.Remove(k);
-                    _dirty = true;
-                }
+                foreach (string k in toRemove) _data.Entries.Remove(k);
+                _dirty = true;
             }
 
             if (_dirty)
@@ -208,6 +189,9 @@ namespace Moraecat.ResourceListCache
 
         private readonly NameCache _cache;
         private readonly IResourceProvider _original;
+        // PruneAndSave 에 전달할 이 쿼리 전용 scope predicate.
+        // streamingAssetsPath + "/" + folder + "/" prefix 에 속하는 엔트리만 pruning 대상.
+        private readonly Func<string, bool> _scopePredicate;
 
         // 3초 메모 캐시
         private List<Resource> _memo;
@@ -215,7 +199,6 @@ namespace Moraecat.ResourceListCache
 
         // 동등성 검증 — 쿼리별 최초 1회만
         private bool _verified;
-        private const bool VerifyAgainstOriginal = true;
 
         public CachedLocalProvider(
             string query,
@@ -233,6 +216,10 @@ namespace Moraecat.ResourceListCache
             _scheme = scheme;
             _cache = cache;
             _original = original;
+            // 로컬 폴더 루트: streamingAssetsPath/Props/ 등. 소문자 슬래시 정규화.
+            string folderRoot = (Application.streamingAssetsPath + "/" + folder + "/")
+                .ToLower().Replace('\\', '/');
+            _scopePredicate = key => key.StartsWith(folderRoot, StringComparison.Ordinal);
         }
 
         public List<Resource> ProvideResources(string query)
@@ -268,14 +255,14 @@ namespace Moraecat.ResourceListCache
                 }
 
                 result = result.ToList().UseFilenameForDuplicates();
-                _cache.PruneAndSave(activePaths);
+                _cache.PruneAndSave(activePaths, _scopePredicate);
 
                 sw.Stop();
                 Debug.Log(string.Format("[ResourceListCache] LOCAL {0}: {1} items, {2}ms ({3})",
                     _query, result.Count, sw.ElapsedMilliseconds, warm ? "warm" : "cold"));
 
                 // 동등성 자가검증 (최초 1회)
-                if (VerifyAgainstOriginal && !_verified)
+                if (CacheSettings.VerifyAgainstOriginal && !_verified)
                 {
                     _verified = true;
                     VerifyAgainstOriginalImpl(result);
@@ -357,6 +344,10 @@ namespace Moraecat.ResourceListCache
         private readonly NameCache _cache;
         private readonly IResourceProvider _original;
         private readonly Func<SteamWorkshop> _workshopGetter;
+        // PruneAndSave 에 전달할 이 쿼리 전용 scope predicate.
+        // 워크숍 설치 경로는 itemId 마다 다르므로, 폴더명("/props/")을 경로 구성요소로 포함하는지로 판별.
+        // Props/Environments/Characters/Particles 는 서로 고유하므로 오탐 없음.
+        private readonly Func<string, bool> _scopePredicate;
 
         // 3초 메모 캐시
         private List<Resource> _memo;
@@ -364,7 +355,6 @@ namespace Moraecat.ResourceListCache
 
         // 동등성 검증 — 쿼리별 최초 1회만
         private bool _verified;
-        private const bool VerifyAgainstOriginal = true;
 
         public CachedWorkshopProvider(
             string query,
@@ -382,6 +372,8 @@ namespace Moraecat.ResourceListCache
             _cache = cache;
             _original = original;
             _workshopGetter = workshopGetter;
+            string folderComponent = "/" + folder.ToLower() + "/";
+            _scopePredicate = key => key.Contains(folderComponent, StringComparison.Ordinal);
         }
 
         public List<Resource> ProvideResources(string query)
@@ -425,14 +417,14 @@ namespace Moraecat.ResourceListCache
                 }
 
                 // 워크숍은 UseFilenameForDuplicates 적용 안 함 (원본과 동일)
-                _cache.PruneAndSave(activePaths);
+                _cache.PruneAndSave(activePaths, _scopePredicate);
 
                 sw.Stop();
                 Debug.Log(string.Format("[ResourceListCache] WORKSHOP {0}: {1} items, {2}ms ({3})",
                     _query, result.Count, sw.ElapsedMilliseconds, warm ? "warm" : "cold"));
 
                 // 동등성 자가검증 (최초 1회)
-                if (VerifyAgainstOriginal && !_verified)
+                if (CacheSettings.VerifyAgainstOriginal && !_verified)
                 {
                     _verified = true;
                     VerifyAgainstOriginalImpl(result);
@@ -745,17 +737,8 @@ namespace Moraecat.ResourceListCache
 
             Debug.Log("[ResourceListCache] All prerequisites ready. Initializing NameCache and swapping providers...");
 
-            try
-            {
-                _cache = new NameCache();
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning("[ResourceListCache] NameCache init failed: " + e.Message);
-                _cache = new NameCache(); // 다시 시도 (빈 캐시)
-            }
+            _cache = new NameCache();
 
-            CommunityPlugin comm = Context.PluginManager.GetPlugin<CommunityPlugin>();
             Func<SteamWorkshop> workshopGetter = () => Context.PluginManager.GetPlugin<CommunityPlugin>()?.SteamWorkshop;
 
             List<IResourceProvider> originals = ProviderSwapper.SwapProviders(_cache, workshopGetter);
