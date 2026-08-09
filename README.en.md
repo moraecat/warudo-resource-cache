@@ -2,7 +2,7 @@
 
 [한국어](README.md) · **English** · [日本語](README.ja.md)
 
-**Download: [ResourceListCachePlugin.cs](https://github.com/moraecat/warudo-resource-cache/raw/main/ResourceListCachePlugin.cs)**
+**Download: [ResourceListCachePlugin.cs](https://github.com/moraecat/warudo-resource-cache/releases/latest/download/ResourceListCachePlugin.cs)**
 
 ---
 
