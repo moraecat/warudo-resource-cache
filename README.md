@@ -1,68 +1,50 @@
 # Warudo Resource List Cache
 
-A single-file Warudo Playground plugin that removes the multi-second UI freeze when opening
-asset **Source** dropdowns (Prop / Environment / Character / Particle) in libraries with many
-mods or Steam Workshop subscriptions.
+모드·워크숍 구독이 많을 때 Prop / Environment / Character / Particle의 **소스 드롭다운이 수 초씩 멈추는 문제**를 해결하는 Warudo Playground 플러그인입니다.
 
-## Problem
+## 원인과 해결
 
-Every dropdown open triggers a full rescan, synchronously on the main thread:
+- 원인: 드롭다운을 열 때마다 모든 모드 파일을 열어 표시 이름을 파싱합니다 (이중 호출 버그로 2배, 결과 캐시는 1초뿐)
+- 해결: 리플렉션으로 기본 프로바이더 8종을 캐싱 버전으로 교체합니다. 표시 이름을 (경로+수정시각) 키로 영속 캐시해 **새로 추가되거나 변경된 파일만** 파싱합니다. 게임 파일은 수정하지 않습니다
 
-- Every `.warudo` file is opened to parse its mod header (and every `.vrm` its meta)
-  just to obtain the display name
-- Each provider is scanned **twice** per query due to a double invocation in
-  `ResourceManager.ProvideResources`
-- The result cache lasts only 1 second, so this happens on virtually every open
+실측 (로컬 300개 + 워크숍 구독 348개 환경): Prop 로컬 189개 수 초 → **약 19ms**, 워크숍 479개 → **약 110ms**. 목록 내용은 원본과 동일합니다.
 
-With 348 Workshop subscriptions (817 `.warudo` files) plus ~300 local mods, each dropdown
-open froze the UI for 2-3 seconds.
+## 설치
 
-## How it works
+1. `ResourceListCachePlugin.cs`를 `Warudo_Data/StreamingAssets/Playground/`에 복사
+2. Warudo 재시작 (제거: 파일 삭제 후 재시작)
 
-At runtime the plugin swaps the 8 stock resource providers (local + Workshop, for the 4
-asset queries above) with caching versions, via reflection. Game files are not modified.
+로그 태그는 `[ResourceListCache]`, 캐시 파일은 `AppData/LocalLow/HakuyaLabs/Warudo/moraecat_resource_name_cache.json` (삭제해도 자동 재생성).
 
-- Display names are cached persistently, keyed by `(path, mtime)` — a file is parsed only
-  when it is new or has changed
-- Directory enumeration stays live, so newly installed mods always appear
-- A 3-second memo absorbs the double-invocation cost
-- Any failure falls back to the stock providers. If a Warudo update breaks the reflection
-  targets, nothing is swapped and stock behavior returns (a warning is logged)
+## 주의
 
-## Results (measured)
+- 내부 API에 리플렉션으로 의존합니다. Warudo 업데이트로 깨지면 아무것도 교체하지 않고 기본 동작으로 복귀합니다 (안전 실패)
+- uMod 플러그인 모드는 `System.Reflection`이 금지라 `.warudo` 패키징이 불가능합니다 — Playground 전용
+- Playground 스크립트는 샌드박스 없이 실행됩니다. 단일 파일이니 설치 전에 소스를 확인하세요
 
-| Query | Before | After (warm) |
-|---|---|---|
-| Prop, 189 local files | seconds | ~19 ms |
-| Prop, 479 Workshop entries | seconds | ~110 ms (pure enumeration) |
+---
 
-Output lists are identical to stock — verified by diffing against the original providers
-on first run.
+## English
 
-## Install
+A Warudo Playground plugin that fixes multi-second freezes of the asset **Source dropdowns** (Prop / Environment / Character / Particle) in libraries with many mods or Workshop subscriptions.
 
-Copy `src/ResourceListCachePlugin.cs` into `Warudo_Data/StreamingAssets/Playground/`.
-Warudo compiles and loads Playground scripts automatically (restart Warudo after copying).
+Every dropdown open re-parses every mod file just for display names (doubled by a double-invocation bug, with only a 1-second cache). This plugin swaps the 8 stock providers with caching versions via reflection: names are cached persistently by (path, mtime), so only new or changed files are parsed. Game files are not modified. Measured: 189 local props from seconds to ~19 ms, 479 Workshop entries to ~110 ms, lists identical to stock.
 
-- Logs are tagged `[ResourceListCache]` in `Player.log`
-- Cache file: `<persistentDataPath>/moraecat_resource_name_cache.json`
-  (`AppData/LocalLow/HakuyaLabs/Warudo/` on Windows) — safe to delete anytime; it rebuilds
-- To remove the plugin, delete the file from Playground and restart
+**Install**: copy `ResourceListCachePlugin.cs` into `Warudo_Data/StreamingAssets/Playground/` and restart Warudo. Remove by deleting the file. Logs: `[ResourceListCache]` in Player.log.
 
-## Caveats
+**Caveats**: relies on runtime internals via reflection — if a Warudo update breaks it, nothing is swapped and stock behavior returns. Playground-only (uMod mods disallow `System.Reflection`). Playground scripts are unsandboxed; it is a single file — read it before installing.
 
-- Relies on Warudo runtime internals via reflection, so a game update may stop it from
-  working — it fails safe (no swap, stock behavior, warning in log)
-- Playground-only by design: uMod plugin mods disallow `System.Reflection`, so this cannot
-  be packaged as a `.warudo` mod
-- Playground scripts run without sandboxing. It is a single file — read it before installing
+---
 
-## 한국어
+## 日本語
 
-모드/워크숍 구독이 많을 때 Prop·Environment 등 에셋 소스 드롭다운이 수 초씩 멈추는 문제를
-해결하는 Playground 플러그인입니다. `src/ResourceListCachePlugin.cs` 파일 하나를
-`Warudo_Data/StreamingAssets/Playground/` 폴더에 복사하고 Warudo를 재시작하면 됩니다.
-제거는 파일 삭제 후 재시작.
+MODやワークショップの購読が多い環境で、Prop / Environment / Character / Particleの**ソースドロップダウンが数秒固まる問題**を解決するWarudo Playgroundプラグインです。
+
+ドロップダウンを開くたびに、表示名のためだけに全MODファイルを開いて解析しています(二重呼び出しバグで2倍、キャッシュは1秒のみ)。本プラグインはリフレクションで標準プロバイダー8種をキャッシュ版に置き換え、表示名を(パス+更新日時)キーで永続キャッシュし、**新規・変更ファイルのみ**解析します。ゲームファイルは変更しません。実測: ローカルProp 189件が数秒→約19ms、ワークショップ479件→約110ms。リスト内容は標準と同一です。
+
+**インストール**: `ResourceListCachePlugin.cs`を`Warudo_Data/StreamingAssets/Playground/`にコピーしてWarudoを再起動。削除はファイルを消して再起動。ログタグは`[ResourceListCache]`。
+
+**注意**: 内部APIにリフレクションで依存しています。アップデートで動かなくなった場合は何も置き換えず標準動作に戻ります(フェイルセーフ)。uModプラグインMODでは`System.Reflection`が禁止のため`.warudo`化は不可、Playground専用です。Playgroundスクリプトはサンドボックスなしで実行されます。単一ファイルなので、導入前にソースをご確認ください。
 
 ---
 
