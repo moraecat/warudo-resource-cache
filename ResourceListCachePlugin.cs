@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading.Tasks;
 using Cysharp.Threading.Tasks;
 using Newtonsoft.Json;
 using UnityEngine;
@@ -190,6 +191,8 @@ namespace Moraecat.ResourceListCache
 
         private readonly NameCache _cache;
         private readonly IResourceProvider _original;
+        internal IResourceProvider Original => _original;
+        internal NameCache Cache => _cache;
         // PruneAndSave 에 전달할 이 쿼리 전용 scope predicate.
         // streamingAssetsPath + "/" + folder + "/" prefix 에 속하는 엔트리만 pruning 대상.
         private readonly Func<string, bool> _scopePredicate;
@@ -226,6 +229,10 @@ namespace Moraecat.ResourceListCache
         public List<Resource> ProvideResources(string query)
         {
             if (query != _query) return null;
+
+            // 픽커가 열리는 순간 = 곧 썸네일 요청이 쏟아지는 순간. 늦게 등록된
+            // 썸네일 리졸버(예: Steam 초기화 후의 Workshop용)도 여기서 반드시 래핑.
+            ResourceListCachePlugin.WrapThumbnailResolvers();
 
             // 3초 메모 캐시
             float now = Time.time;
@@ -344,6 +351,8 @@ namespace Moraecat.ResourceListCache
 
         private readonly NameCache _cache;
         private readonly IResourceProvider _original;
+        internal IResourceProvider Original => _original;
+        internal NameCache Cache => _cache;
         private readonly Func<SteamWorkshop> _workshopGetter;
         // PruneAndSave 에 전달할 이 쿼리 전용 scope predicate.
         // 워크숍 설치 경로는 itemId 마다 다르므로, 폴더명("/props/")을 경로 구성요소로 포함하는지로 판별.
@@ -386,6 +395,10 @@ namespace Moraecat.ResourceListCache
         public List<Resource> ProvideResources(string query)
         {
             if (query != _query) return null;
+
+            // 픽커가 열리는 순간 = 곧 썸네일 요청이 쏟아지는 순간. 늦게 등록된
+            // 썸네일 리졸버(예: Steam 초기화 후의 Workshop용)도 여기서 반드시 래핑.
+            ResourceListCachePlugin.WrapThumbnailResolvers();
 
             // 3초 메모 캐시
             float now = Time.time;
@@ -695,19 +708,387 @@ namespace Moraecat.ResourceListCache
     [PluginType(
         Id = "Moraecat.ResourceListCache",
         Name = "Resource List Cache",
-        Description = "Prop/Environment/Character/Particle 소스 드롭다운 캐싱으로 응답 속도 개선",
+        Description = "Prop/Environment/Character/Particle 소스 드롭다운 캐싱으로 응답 속도 개선 + 썸네일 uMod 파싱 메인스레드 가드(픽커 직후 모드 로드 크래시 방지, 한 프레임에 하나씩 + 디스크 썸네일 캐시로 멈춤 방지)",
         Author = "moraecat",
-        Version = "0.1.0",
+        Version = "0.3.0",
         AssetTypes = new Type[] { },
         NodeTypes = new Type[] { })]
     public class ResourceListCachePlugin : Plugin
     {
         private NameCache _cache;
+        private ResourceManager _resourceManager;
+        private bool _destroyed;
+        private static ResourceListCachePlugin _active;
 
         protected override void OnCreate()
         {
             base.OnCreate();
+            _destroyed = false;
+            _active = this;
+            _lastWrapTime = -999f;
+            _resourceManager = Context.ResourceManager;
             InitAsync().Forget();
+            ThumbnailCacheDirectory = Path.Combine(Application.persistentDataPath, "moraecat_thumbnail_cache");
+            WrapThumbnailResolvers();
+            Task.Run(PruneThumbnailCache);
+        }
+
+        public override void OnUpdate()
+        {
+            base.OnUpdate();
+            if (!_destroyed) WrapThumbnailResolvers();
+        }
+
+        protected override void OnDestroy()
+        {
+            // Stop pending initialization and calls from stale cached providers first.
+            // OnUpdate replaces the old uncancellable periodic async loop.
+            _destroyed = true;
+            if (ReferenceEquals(_active, this)) _active = null;
+            try
+            {
+                RestoreOwnedRegistrations();
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[ResourceListCache] Registration cleanup failed: " + e);
+            }
+            finally
+            {
+                GuardedThumbnailResolver.ClearCache();
+                _cache = null;
+                _resourceManager = null;
+                base.OnDestroy();
+            }
+        }
+
+        private void RestoreOwnedRegistrations()
+        {
+            if (_resourceManager == null) return;
+            var thumbnailField = typeof(ResourceManager).GetField("uriThumbnailResolvers", BindingFlags.Instance | BindingFlags.NonPublic);
+            var thumbnails = thumbnailField?.GetValue(_resourceManager) as Dictionary<string, List<IResourceUriThumbnailResolver>>;
+            if (thumbnails != null)
+            {
+                foreach (var list in thumbnails.Values)
+                {
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        if (list[i] is GuardedThumbnailResolver guard && ReferenceEquals(guard.Owner, this))
+                            list[i] = guard.Inner;
+                    }
+                }
+            }
+            var providerField = typeof(ResourceManager).GetField("providers", BindingFlags.Instance | BindingFlags.NonPublic);
+            var providers = providerField?.GetValue(_resourceManager) as Dictionary<string, List<IResourceProvider>>;
+            if (providers == null) return;
+            foreach (var list in providers.Values)
+            {
+                for (int i = 0; i < list.Count; i++)
+                {
+                    if (list[i] is CachedLocalProvider local && ReferenceEquals(local.Cache, _cache))
+                        list[i] = local.Original;
+                    else if (list[i] is CachedWorkshopProvider workshop && ReferenceEquals(workshop.Cache, _cache))
+                        list[i] = workshop.Original;
+                }
+            }
+        }
+
+        // Keep main-thread marshaling for direct callers as well as the HTTP API.
+        // Hot reload creates new CLR types: identify previous guards by full name,
+        // not just `is`, and never build a recursive chain of guards.
+
+        // Why a guard at all (v0.2.0, 2026-08-16): Warudo's /api/thumbnail handler parses
+        // .warudo headers with ModDirectory.GetMod() on a web-server worker thread. uMod is
+        // not thread-safe, so that parse overlapping Mod.Load on the main thread crashed
+        // mono (AV in mono-2.0-bdwgc.dll+0x1D7F83, reproduced 5 times: picking a prop in the
+        // picker and immediately throwing/adding an asset). Marshaling every resolver call
+        // onto the main thread makes the overlap structurally impossible.
+        //
+        // v0.3.0: the guard used to run every thumbnail parse on the main thread back to
+        // back, so opening a picker with ~80 .warudo files froze Warudo for minutes (and
+        // sometimes got it killed). Parsing still happens on the main thread (that is what
+        // prevents the mod-load crash), but now:
+        //  - a disk cache keyed by file path + mtime + size means a file is parsed once, ever;
+        //  - parses are serialized and spaced one per frame, so the UI keeps drawing;
+        //  - concurrent requests for the same URI share one parse;
+        //  - the memory cache is bounded by bytes, and failures are remembered;
+        //  - nothing new starts once the plugin is shutting down.
+        private class GuardedThumbnailResolver : IResourceUriThumbnailResolver
+        {
+            public IResourceUriThumbnailResolver Inner;
+            public ResourceListCachePlugin Owner;
+
+            private const long MemoryBudgetBytes = 32L * 1024 * 1024;
+            private static readonly object CacheLock = new object();
+            private static readonly Dictionary<string, byte[]> Cache = new Dictionary<string, byte[]>();
+            private static readonly LinkedList<string> CacheOrder = new LinkedList<string>();
+            private static readonly HashSet<string> Failed = new HashSet<string>();
+            private static readonly Dictionary<string, Task<byte[]>> InFlight = new Dictionary<string, Task<byte[]>>();
+            private static readonly System.Threading.SemaphoreSlim MainThreadGate = new System.Threading.SemaphoreSlim(1, 1);
+            private static long _cacheBytes;
+            private static readonly Dictionary<Type, MethodInfo> FilePathMethods = new Dictionary<Type, MethodInfo>();
+
+            public static void ClearCache()
+            {
+                lock (CacheLock)
+                {
+                    Cache.Clear();
+                    CacheOrder.Clear();
+                    Failed.Clear();
+                    _cacheBytes = 0;
+                }
+            }
+
+            public Task<byte[]> Resolve(Uri uri)
+            {
+                if (uri == null) return Task.FromResult<byte[]>(null);
+                string key = uri.OriginalString;
+                lock (CacheLock)
+                {
+                    if (Cache.TryGetValue(key, out byte[] hit)) return Task.FromResult(hit);
+                    if (Failed.Contains(key)) return Task.FromResult<byte[]>(null);
+                    if (InFlight.TryGetValue(key, out Task<byte[]> running)) return running;
+                    Task<byte[]> task = ResolveUncached(uri, key);
+                    if (!task.IsCompleted) InFlight[key] = task;
+                    return task;
+                }
+            }
+
+            private async Task<byte[]> ResolveUncached(Uri uri, string key)
+            {
+                try
+                {
+                    // Disk first: no parsing at all for files we have seen before.
+                    string diskPath = DiskCachePath(uri);
+                    if (diskPath != null && File.Exists(diskPath))
+                    {
+                        byte[] stored = File.ReadAllBytes(diskPath);
+                        Remember(key, stored);
+                        return stored;
+                    }
+
+                    byte[] result = null;
+                    await MainThreadGate.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        if (IsShuttingDown) return null;
+                        await UniTask.SwitchToMainThread();
+                        if (IsShuttingDown) return null;
+                        Task<byte[]> task = Inner.Resolve(uri);
+                        if (task != null) result = await task;
+                        // Let a frame render before the next queued parse.
+                        await UniTask.SwitchToMainThread();
+                        await UniTask.NextFrame();
+                    }
+                    finally
+                    {
+                        MainThreadGate.Release();
+                    }
+
+                    if (result == null)
+                    {
+                        lock (CacheLock) Failed.Add(key);
+                        return null;
+                    }
+                    Remember(key, result);
+                    if (diskPath != null) WriteDiskCache(diskPath, result);
+                    return result;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning("[ResourceListCache] Thumbnail resolve failed for " + key + ": " + e.Message);
+                    lock (CacheLock) Failed.Add(key);
+                    return null;
+                }
+                finally
+                {
+                    lock (CacheLock) InFlight.Remove(key);
+                }
+            }
+
+            private bool IsShuttingDown => Owner == null || Owner._destroyed;
+
+            private static void Remember(string key, byte[] data)
+            {
+                if (data == null || data.LongLength > MemoryBudgetBytes) return;
+                lock (CacheLock)
+                {
+                    if (Cache.TryGetValue(key, out byte[] old))
+                    {
+                        _cacheBytes -= old.LongLength;
+                        CacheOrder.Remove(key);
+                    }
+                    Cache[key] = data;
+                    CacheOrder.AddLast(key);
+                    _cacheBytes += data.LongLength;
+                    while (_cacheBytes > MemoryBudgetBytes && CacheOrder.First != null)
+                    {
+                        string oldest = CacheOrder.First.Value;
+                        CacheOrder.RemoveFirst();
+                        if (Cache.TryGetValue(oldest, out byte[] evicted))
+                        {
+                            _cacheBytes -= evicted.LongLength;
+                            Cache.Remove(oldest);
+                        }
+                    }
+                }
+            }
+
+            // Key = source file path + modified time + size, so an updated file is re-parsed.
+            private string DiskCachePath(Uri uri)
+            {
+                try
+                {
+                    string source = SourceFilePath(uri);
+                    if (ThumbnailCacheDirectory == null || string.IsNullOrEmpty(source) || !File.Exists(source)) return null;
+                    var info = new FileInfo(source);
+                    string identity = source.ToLowerInvariant().Replace('\\', '/') + "|" + info.LastWriteTimeUtc.Ticks + "|" + info.Length;
+                    using (var sha = System.Security.Cryptography.SHA1.Create())
+                    {
+                        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(identity));
+                        return Path.Combine(ThumbnailCacheDirectory, BitConverter.ToString(hash).Replace("-", string.Empty) + ".thumb");
+                    }
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            private string SourceFilePath(Uri uri)
+            {
+                if (Inner == null) return null;
+                Type type = Inner.GetType();
+                MethodInfo method;
+                lock (FilePathMethods)
+                {
+                    if (!FilePathMethods.TryGetValue(type, out method))
+                    {
+                        method = type.GetMethod("ResolveFilePath", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                            null, new[] { typeof(Uri) }, null);
+                        FilePathMethods[type] = method;
+                    }
+                }
+                return method?.Invoke(Inner, new object[] { uri }) as string;
+            }
+
+            private static void WriteDiskCache(string path, byte[] data)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    string temp = path + ".tmp";
+                    File.WriteAllBytes(temp, data);
+                    if (File.Exists(path)) File.Delete(path);
+                    File.Move(temp, path);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning("[ResourceListCache] Thumbnail disk cache write failed: " + e.Message);
+                }
+            }
+        }
+
+        // Captured on the main thread in OnCreate: Unity paths cannot be read from worker threads.
+        internal static string ThumbnailCacheDirectory;
+
+        // Drop thumbnails unused for 60 days and keep the folder under 300 MB.
+        private static void PruneThumbnailCache()
+        {
+            try
+            {
+                if (ThumbnailCacheDirectory == null) return;
+                var dir = new DirectoryInfo(ThumbnailCacheDirectory);
+                if (!dir.Exists) return;
+                var files = dir.GetFiles("*.thumb").OrderByDescending(f => f.LastAccessTimeUtc).ToList();
+                long total = 0;
+                DateTime cutoff = DateTime.UtcNow.AddDays(-60);
+                int removed = 0;
+                foreach (var file in files)
+                {
+                    total += file.Length;
+                    if (file.LastAccessTimeUtc < cutoff || total > 300L * 1024 * 1024)
+                    {
+                        try { file.Delete(); removed++; } catch { }
+                    }
+                }
+                foreach (var temp in dir.GetFiles("*.tmp")) { try { temp.Delete(); } catch { } }
+                if (removed > 0) Debug.Log("[ResourceListCache] Pruned " + removed + " old thumbnail(s).");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[ResourceListCache] Thumbnail cache prune failed: " + e.Message);
+            }
+        }
+
+        private static bool IsThumbnailGuard(IResourceUriThumbnailResolver resolver)
+        {
+            return resolver != null && resolver.GetType().FullName == typeof(GuardedThumbnailResolver).FullName;
+        }
+
+        private static IResourceUriThumbnailResolver UnwrapThumbnailGuard(IResourceUriThumbnailResolver resolver)
+        {
+            var visited = new HashSet<IResourceUriThumbnailResolver>();
+            while (IsThumbnailGuard(resolver))
+            {
+                if (!visited.Add(resolver)) throw new InvalidOperationException("Cyclic thumbnail guard chain");
+                var inner = resolver.GetType().GetField("Inner", BindingFlags.Instance | BindingFlags.Public);
+                resolver = inner?.GetValue(resolver) as IResourceUriThumbnailResolver;
+                if (resolver == null) throw new InvalidOperationException("Thumbnail guard has no inner resolver");
+            }
+            return resolver;
+        }
+
+        private static float _lastWrapTime = -999f;
+
+        internal static void WrapThumbnailResolvers()
+        {
+            if (_active == null || _active._destroyed) return;
+            // 호출 폭주 방지 (픽커 쿼리마다 불리므로)
+            if (Time.realtimeSinceStartup - _lastWrapTime < 1f)
+            {
+                return;
+            }
+            _lastWrapTime = Time.realtimeSinceStartup;
+            try
+            {
+                ResourceManager rm = Context.ResourceManager;
+                if (rm == null) return;
+                _active._resourceManager = rm;
+                FieldInfo field = typeof(ResourceManager).GetField("uriThumbnailResolvers", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (field == null)
+                {
+                    Debug.LogError("[ResourceListCache] uriThumbnailResolvers field not found - Warudo version mismatch?");
+                    return;
+                }
+                var dict = (Dictionary<string, List<IResourceUriThumbnailResolver>>)field.GetValue(rm);
+                int wrapped = 0;
+                foreach (List<IResourceUriThumbnailResolver> list in dict.Values)
+                {
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        IResourceUriThumbnailResolver resolver = list[i];
+                        if (IsThumbnailGuard(resolver))
+                        {
+                            var inner = resolver.GetType().GetField("Inner", BindingFlags.Instance | BindingFlags.Public)
+                                ?.GetValue(resolver) as IResourceUriThumbnailResolver;
+                            // One guard is sufficient, including one from another assembly.
+                            if (inner != null && !IsThumbnailGuard(inner)) continue;
+                            resolver = UnwrapThumbnailGuard(resolver);
+                        }
+                        list[i] = new GuardedThumbnailResolver { Inner = resolver, Owner = _active };
+                        wrapped++;
+                    }
+                }
+                if (wrapped > 0)
+                {
+                    Debug.Log($"[ResourceListCache] Wrapped {wrapped} thumbnail resolver(s) - uMod parsing now main-thread only");
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogError("[ResourceListCache] Thumbnail resolver wrap failed: " + e);
+            }
         }
 
         private async UniTaskVoid InitAsync()
@@ -715,13 +1096,14 @@ namespace Moraecat.ResourceListCache
             Debug.Log("[ResourceListCache] InitAsync started. Waiting for CommunityPlugin and providers...");
 
             const float TimeoutSeconds = 30f;
-            float deadline = Time.time + TimeoutSeconds;
+            float deadline = Time.realtimeSinceStartup + TimeoutSeconds;
 
             // CommunityPlugin 이 로드되고 SteamWorkshop 이 null 이 아닐 때까지 대기
             // 또한 providers 딕셔너리에 교체 대상 8종이 모두 등록될 때까지 대기
             while (true)
             {
-                if (Time.time > deadline)
+                if (_destroyed) return;
+                if (Time.realtimeSinceStartup > deadline)
                 {
                     Debug.LogWarning("[ResourceListCache] Timed out waiting for CommunityPlugin/providers. No providers replaced.");
                     return;
